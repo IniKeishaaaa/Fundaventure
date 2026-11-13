@@ -5,10 +5,10 @@ extends Control
 # Buku yang selalu ada di layar battle:
 # - Idle            : buku TERTUTUP (Bukuclose.png), di BELAKANG kartu di tangan
 # - Kartu dipilih   : buku TERBUKA (Bukuopen.png). Kiri = kartu yang dipilih, kanan = gambar bentuk
-# - Selesai / Batal : buku menutup lagi
+# - Gambar cukup akurat : kartu otomatis dipakai dan buku menutup lagi
 
-signal confirmed(bonus: float)   # pemain menekan "Selesai". bonus = tambahan damage/block (0.0 - MAX_BONUS)
-signal cancelled                 # pemain menekan "Batal" (kartu kembali ke tangan)
+signal confirmed(bonus: float)   # gambar sudah cukup akurat. bonus = tambahan damage/block (0.0 - MAX_BONUS)
+signal cancelled                 # (tidak dipakai lagi, dibiarkan supaya battle.gd tidak error)
 
 signal skip_pressed              # pemain menekan pita 1 (skip turn)
 
@@ -60,8 +60,8 @@ const INK_COLOR := Color(0.1, 0.1, 0.18)
 const GUIDE_COLOR := Color(0.35, 0.35, 0.45, 0.5)
 const LINE_WIDTH := 3.0
 
-# Posisi vertikal baris tombol & label akurasi (persen tinggi buku).
-# Sebelumnya 0.81. Lebih kecil = naik, lebih besar = turun.
+# Posisi vertikal label akurasi (persen tinggi buku).
+# Lebih kecil = naik, lebih besar = turun.
 const BUTTON_ROW_Y := 0.78
 
 # ----- Bonus akurasi -----
@@ -69,21 +69,24 @@ const BUTTON_ROW_Y := 0.78
 # Bonus menambah damage kartu ofensif dan block kartu defensif.
 const MAX_BONUS := 0.5        # 0.5 = maksimal +50%
 
+# Jeda (detik) setelah goresan terakhir sebelum gambar yang kurang akurat dihapus otomatis.
+# Selama jeda ini kamu masih bisa menambah goresan (untuk bentuk yang butuh beberapa goresan).
+const AUTO_CLEAR_DELAY := 0.8
+
 # ----- Level kesulitan gambar (mengikuti map: GameAssets.selected_enemy_index) -----
 # shapes : bentuk yang mungkin muncul (dipilih acak)
 # tol    : toleransi jarak goresan dari garis panduan (persen dari ukuran bentuk, makin kecil = makin sulit)
-# need   : akurasi minimum supaya tombol Selesai aktif (0.0 - 1.0)
+# need   : akurasi minimum supaya kartu terpakai (0.0 - 1.0)
 const LEVELS := [
 	{"shapes": ["circle", "square", "triangle"], "tol": 0.24, "need": 0.50},
 	{"shapes": ["diamond", "hexagon", "cross"], "tol": 0.18, "need": 0.60},
 	{"shapes": ["star", "heart", "bolt"], "tol": 0.14, "need": 0.70},
 ]
-# false = bentuk hanya jadi panduan, Selesai aktif asal sudah menggambar sesuatu
+# false = bentuk hanya jadi panduan, kartu terpakai asal sudah menggambar sesuatu
 const REQUIRE_ACCURACY := true
 
 var cards: Array[CardData] = []
 var pad: DrawPad
-var done_button: Button
 var is_open := false
 
 var _closed_book: Control
@@ -91,6 +94,7 @@ var _open_book: Control
 var _score_label: Label
 var _tol_px := 10.0
 var _need := 0.5
+var _clear_token := 0          # penanda timer hapus otomatis (supaya timer lama diabaikan)
 
 var _tabs: Dictionary = {}     # nomor pita -> BookTab
 var _tabs_root: Control
@@ -103,6 +107,8 @@ var _closed_w := 420.0
 # ============================================================
 class DrawPad extends Control:
 	signal changed
+	signal stroke_started    # pemain mulai menggores (klik ditekan)
+	signal stroke_finished   # pemain selesai menggores (klik dilepas)
 
 	var strokes: Array[PackedVector2Array] = []
 	var guide := PackedVector2Array()     # bentuk tertutup (garis panduan)
@@ -112,7 +118,13 @@ class DrawPad extends Control:
 	func _init() -> void:
 		mouse_filter = Control.MOUSE_FILTER_STOP
 		clip_contents = true
-		mouse_exited.connect(func(): _drawing = false)
+		mouse_exited.connect(_on_mouse_exited)
+
+	# Kalau kursor keluar saat menggores, goresan dianggap selesai
+	func _on_mouse_exited() -> void:
+		if _drawing:
+			_drawing = false
+			stroke_finished.emit()
 
 	# points = sudut-sudut bentuk (dalam piksel pad), otomatis ditutup
 	func set_shape(points: PackedVector2Array) -> void:
@@ -133,8 +145,14 @@ class DrawPad extends Control:
 			if event.pressed:
 				_drawing = true
 				strokes.append(PackedVector2Array([_clamp(event.position)]))
+				stroke_started.emit()
 			else:
-				_drawing = false
+				if _drawing:
+					_drawing = false
+					queue_redraw()
+					changed.emit()
+					stroke_finished.emit()
+				return
 			queue_redraw()
 			changed.emit()
 		elif event is InputEventMouseMotion and _drawing and not strokes.is_empty():
@@ -417,6 +435,7 @@ func open(card_list: Array[CardData]) -> void:
 		return
 	setup()   # jaga-jaga kalau belum dibuat
 	is_open = true
+	_clear_token += 1
 	cards = card_list.duplicate()
 	z_index = OPEN_Z   # buku terbuka tampil di atas kartu
 
@@ -490,6 +509,8 @@ func _build_content(bs: Vector2) -> void:
 	pad.position = rp.position
 	pad.size = rp.size
 	pad.changed.connect(_on_pad_changed)
+	pad.stroke_started.connect(_on_stroke_started)
+	pad.stroke_finished.connect(_on_stroke_finished)
 	_open_book.add_child(pad)
 
 	# Pilih bentuk sesuai level (map)
@@ -505,43 +526,16 @@ func _build_content(bs: Vector2) -> void:
 	_tol_px = radius * float(cfg["tol"])
 	_need = float(cfg["need"])
 
-	# --- Tombol Batal (kiri bawah) ---
-	var left_row := HBoxContainer.new()
-	left_row.position = Vector2(bs.x * 0.09, bs.y * BUTTON_ROW_Y)
-	left_row.size = Vector2(bs.x * 0.2, 36)
-	_open_book.add_child(left_row)
-
-	var cancel_btn := Button.new()
-	cancel_btn.text = "Batal"
-	cancel_btn.pressed.connect(func(): _close_book(false))
-	left_row.add_child(cancel_btn)
-
-	# --- Kanan bawah: info akurasi + Hapus + Selesai, sejajar di bawah garis halaman kanan ---
-	var right_row := HBoxContainer.new()
-	right_row.position = Vector2(rp.position.x, bs.y * BUTTON_ROW_Y)
-	right_row.size = Vector2(rp.size.x, 36)
-	right_row.add_theme_constant_override("separation", 6)
-	_open_book.add_child(right_row)
-
+	# --- Info akurasi di bawah halaman kanan (tidak ada tombol lagi) ---
 	_score_label = Label.new()
-	_score_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_score_label.position = Vector2(rp.position.x, bs.y * BUTTON_ROW_Y)
+	_score_label.size = Vector2(rp.size.x, 36)
 	_score_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_score_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	_score_label.add_theme_font_size_override("font_size", 11)
 	_score_label.add_theme_color_override("font_color", INK_COLOR)
 	_score_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	right_row.add_child(_score_label)
-
-	var clear_btn := Button.new()
-	clear_btn.text = "Hapus"
-	clear_btn.pressed.connect(func(): pad.clear_all())
-	right_row.add_child(clear_btn)
-
-	done_button = Button.new()
-	done_button.text = "Selesai"
-	done_button.disabled = true
-	done_button.pressed.connect(func(): _close_book(true))
-	right_row.add_child(done_button)
+	_open_book.add_child(_score_label)
 
 	_update_score()
 
@@ -552,6 +546,7 @@ func _build_content(bs: Vector2) -> void:
 func _close_book(accepted: bool) -> void:
 	if not is_open:
 		return
+	_clear_token += 1   # batalkan timer hapus otomatis yang masih menunggu
 	var bonus := 0.0
 	if accepted and pad != null:
 		bonus = bonus_for(pad.score(_tol_px), _need)
@@ -562,7 +557,6 @@ func _close_book(accepted: bool) -> void:
 		_open_book.queue_free()
 		_open_book = null
 	pad = null
-	done_button = null
 	_score_label = null
 
 	# Kembali ke buku tertutup
@@ -665,14 +659,37 @@ func _on_pad_changed() -> void:
 	_update_score()
 
 
+# Mulai goresan baru: batalkan timer hapus otomatis yang sedang menunggu
+func _on_stroke_started() -> void:
+	_clear_token += 1
+
+
+# Goresan selesai: kalau sudah cukup akurat kartu langsung dipakai,
+# kalau belum, gambar dihapus otomatis setelah jeda (kecuali ada goresan baru).
+func _on_stroke_finished() -> void:
+	if not is_open or pad == null:
+		return
+	var sc := pad.score(_tol_px)
+	var ok := not pad.strokes.is_empty()
+	if REQUIRE_ACCURACY:
+		ok = ok and sc >= _need
+	if ok:
+		_close_book(true)
+		return
+	_clear_token += 1
+	var token := _clear_token
+	await get_tree().create_timer(AUTO_CLEAR_DELAY).timeout
+	if token != _clear_token or not is_open or pad == null:
+		return
+	pad.clear_all()
+
+
 func _update_score() -> void:
-	if pad == null or done_button == null:
+	if pad == null or _score_label == null:
 		return
 	var sc := pad.score(_tol_px)
 	var bonus := bonus_for(sc, _need)
 	if REQUIRE_ACCURACY:
 		_score_label.text = "Akurasi %d%% (min %d%%)\nBonus +%d%%" % [roundi(sc * 100.0), roundi(_need * 100.0), roundi(bonus * 100.0)]
-		done_button.disabled = pad.strokes.is_empty() or sc < _need
 	else:
 		_score_label.text = "Akurasi %d%%\nBonus +%d%%" % [roundi(sc * 100.0), roundi(bonus * 100.0)]
-		done_button.disabled = pad.strokes.is_empty()
